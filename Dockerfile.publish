@@ -1,0 +1,28 @@
+# ==========================================
+# 发布专用 Dockerfile (不包含构建过程)
+# ==========================================
+FROM python:3.9-slim-bullseye
+
+WORKDIR /app
+
+# 安装运行时必需的系统库 (与您原 Dockerfile Runtime 阶段保持一致)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# [核心] 使用 ARG TARGETARCH 自动区分架构
+# Docker 构建时会自动传入 amd64 或 arm64
+ARG TARGETARCH
+
+# 将准备好的文件复制进镜像
+# 注意：我们将在 build.yml 中把文件整理到 dist/linux/amd64/ 等目录中
+COPY dist/linux/${TARGETARCH}/ /app/
+
+# 赋予执行权限
+RUN chmod +x /app/NodeTool
+
+# 暴露端口
+EXPOSE 5000
+
+# 启动命令
+CMD ["./NodeTool"]
