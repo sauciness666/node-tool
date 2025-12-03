@@ -1,0 +1,218 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+jobs:
+  # ----------------------------------------------------------------
+  # 任务 1: Windows 构建
+  # ----------------------------------------------------------------
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+    - name: Run Build Script
+      run: python build.py
+
+    - name: Upload Windows Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: NodeTool-Windows-amd64
+        # [修改] 上传 release 文件夹。GitHub 会自动把它打包成 NodeTool-Windows-amd64.zip
+        path: release/
+        retention-days: 1
+
+  # ----------------------------------------------------------------
+  # 任务 2: Linux 构建 (AMD64 和 ARM64)
+  # ----------------------------------------------------------------
+  build-linux:
+    runs-on: ubuntu-latest
+    # [优化] 设置超时时间，防止 QEMU 模拟卡死导致无限等待
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+            
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Docker Image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: Dockerfile
+        target: builder
+        load: true
+        tags: node-tool-builder:latest
+        platforms: ${{ matrix.platform }}
+        # [优化] 为不同架构指定独立的缓存作用域
+        # 这样 arm64 的缓存不会被 amd64 覆盖，能显著加速依赖安装过程
+        cache-from: type=gha,scope=${{ github.workflow }}-${{ matrix.arch }}
+        cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ matrix.arch }}
+
+    - name: Run Build and Extract
+      run: |
+        echo "Current workspace: ${{ github.workspace }}"
+        # [修改] 不再复制 zip，而是复制 release 文件夹
+        docker run --rm --platform ${{ matrix.platform }} \
+        -v "${{ github.workspace }}:/output" \
+        node-tool-builder:latest \
+        sh -c "python build.py && cp -r release /output/"
+    - name: Upload Linux Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: NodeTool-Linux-${{ matrix.arch }}
+        # [修改] 上传 release 文件夹
+        path: release/
+        retention-days: 1
+
+  # ----------------------------------------------------------------
+  # 任务 3: 发布 Release
+  # ----------------------------------------------------------------
+  create-release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      
+    steps:
+    # 1. 下载 Artifacts (此时下载下来的是解压后的文件夹)
+    - name: Download All Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: release_assets
+
+    # 2.[核心] 重新打包为 Zip
+    # 由于下载下来的是文件夹，我们需要手动将每个文件夹压缩成 zip，以便发布到 Releases
+    - name: Zip Assets for Release
+      run: |
+        mkdir final_assets
+        cd release_assets
+        # 遍历所有下载的文件夹 (例如 NodeTool-Windows-amd64)
+        for dir in */; do
+            # 去掉末尾的斜杠
+            dirname=${dir%/}
+            echo "Zipping $dirname..."
+            # 进入文件夹进行压缩，这样解压时不会多一层父目录
+            cd "$dirname"
+            zip -r "../../final_assets/${dirname}.zip" .
+            cd ..
+        done
+        echo "Files to be released:"
+        ls -lh ../final_assets/
+    # 3. 创建 GitHub Release 并上传文件
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.event.inputs.tag_name }}
+        name: Release ${{ github.event.inputs.tag_name }}
+        draft: false
+        prerelease: false
+        files: final_assets/*.zip
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# ----------------------------------------------------------------
+  # 任务 4: 构建并推送 Docker 镜像 (复用产物，极速构建)
+  # ----------------------------------------------------------------
+  push-docker:
+    # 依赖 build-linux 任务完成，确保有 Artifacts 可下载
+    # 也可以依赖 create-release，看您希望何时触发
+    needs: [build-linux, create-release] 
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 1. 下载之前构建好的 Linux 二进制文件
+      # pattern 匹配 build-linux 任务上传的 artifact 名称
+      - name: Download Linux Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: NodeTool-Linux-*
+          path: download_artifacts
+
+      # 2. [关键] 整理文件结构以适配 Dockerfile.publish
+      # 我们将下载的文件移动到 dist/linux/amd64 和 dist/linux/arm64
+      # 这样 Dockerfile 中的 COPY 指令就能通过 ${TARGETARCH} 找到对应文件
+      - name: Prepare Build Context
+        run: |
+          mkdir -p dist/linux/amd64
+          mkdir -p dist/linux/arm64
+          
+          echo "Moving artifacts to build context..."
+          # download-artifact v4 会解压到以 artifact 名字命名的文件夹中
+          # 将内容复制到目标架构目录
+          cp -r download_artifacts/NodeTool-Linux-amd64/* dist/linux/amd64/
+          cp -r download_artifacts/NodeTool-Linux-arm64/* dist/linux/arm64/
+          
+          echo "Structure of dist folder:"
+          ls -R dist/
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ github.event.inputs.tag_name }}
+      # 3. 构建镜像 (使用 Dockerfile.publish)
+      # 此时不再运行 PyInstaller，只是复制文件，速度极快
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.publish
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 关闭来源证明，让镜像列表更干净
+          provenance: false
