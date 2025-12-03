@@ -17,7 +17,7 @@ PORT=5000
 LOG_FILE="$INSTALL_DIR/server.log"
 
 # --- GitHub 配置 ---
-REPO_OWNER="konxinhaos"               # 项目所属用户
+REPO_OWNER="sauciness666"               # 项目所属用户
 REPO_NAME="node-tool"              # 仓库名称
 # ---------------------
 
