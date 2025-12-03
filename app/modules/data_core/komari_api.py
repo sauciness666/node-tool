@@ -37,11 +37,32 @@ def _get_komari_headers():
     token = get_config('KOMARI_API_TOKEN', 'YOUR_DEFAULT_TOKEN')
     
     headers = {
-        'Accept': 'application/json',
-        # 如需认证请取消注释下行，并配置 Token
-        # 'Authorization': f'Bearer {token}' 
+        'Accept': 'application/json'
     }
+
+    token = token.strip()
+    if token:
+        # Komari 的认证使用 Authorization 头
+        headers['Authorization'] = f'Bearer {token}'
     return headers
+
+
+def _mask_sensitive_headers(headers):
+    """打印日志前对敏感 Header 做模糊处理"""
+    masked = {}
+    for key, value in headers.items():
+        key_lower = key.lower()
+        if key_lower in ['authorization', 'api-key', 'x-api-key', 'token']:
+            masked[key] = '***MASKED***'
+        else:
+            masked[key] = value
+    return masked
+
+
+def _log_request_preamble(label, url, headers, params=None):
+    masked_headers = _mask_sensitive_headers(headers or {})
+    params_repr = params if params else {}
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {label} -> URL: {url} Headers: {masked_headers} Params: {params_repr}")
 
 def _extract_nested_value(data, keys, default=0.0):
     """
@@ -71,6 +92,7 @@ def sync_node_list():
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 尝试同步 Komari 节点列表...")
     
     try:
+        _log_request_preamble('Komari-NodeList', url, headers)
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status() 
         data = response.json()
@@ -119,6 +141,7 @@ def fetch_and_save_snapshots():
         headers = _get_komari_headers()
 
         try:
+            _log_request_preamble('Komari-Snapshot', url, headers)
             response = requests.get(url, headers=headers, timeout=5)
             response.raise_for_status()
             data = response.json()
